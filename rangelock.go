@@ -24,6 +24,7 @@ type Range struct {
     endOffset uint64
     readers []uint64    // list of readers on this range
     writer uint64       // exclusive writer on this range
+    waiters uint        // waiters on this range
 }
 
 // generic object that has range locks
@@ -75,12 +76,22 @@ try_again:
      if rw == WRITE {
         for _, ra := range obj.locks.lockedRanges {
             if ra.rangeConflict(startOff) {
-                // wait on waiters queue
-                obj.locks.cond.Wait()
-                // retry lock
-                goto try_again
+                if len(ra.readers) > 0 {
+                    ra.waiters++
+                    // wait on waiters queue
+                    fmt.Println("writer waiting:", ownerId)
+                    obj.locks.cond.Wait()
+                    ra.waiters--
+                    // retry lock
+                    goto try_again
+                } else if ra.waiters == 0 {
+                    fmt.Println("release range after waiting")
+                    // release range
+                    delete(obj.locks.lockedRanges, ra.startOffset)
+                }
             }
         }
+        fmt.Println("writer success")
         // new range writer lock
         newra := &Range{}
         newra.startOffset = startOff
@@ -95,21 +106,47 @@ try_again:
                 // exact match check for re-entrancy
                 for _, rdrId := range ra.readers {
                     if rdrId == ownerId {
+                        fmt.Println("Existing reader")
                         return startOff, nil
                     }
                 }
-                // add reader Id to readers
-                ra.readers = append(ra.readers, ownerId)
-                return startOff, nil
-           }
+                // no writer
+                if ra.writer == 0 {
+                    fmt.Println("Adding reader", ownerId)
+                    // add reader Id to readers
+                    ra.readers = append(ra.readers, ownerId)
+                    return startOff, nil
+                } else {
+                    fmt.Println("reader waiting")
+                    ra.waiters++
+                    // wait on waiters queue
+                    obj.locks.cond.Wait()
+                    ra.waiters--
+                    goto try_again
+                }
+            } else {
+                // check for conflict with writer on overlapping range
+                for _, ra := range obj.locks.lockedRanges {
+                    if ra.writer != 0 && ra.rangeConflict(startOff) {
+                        ra.waiters++
+                        fmt.Println("reader waiting on writer")
+                        // wait on waiters queue
+                        obj.locks.cond.Wait()
+                        ra.waiters--
+                        goto try_again
+                    }
+                }
+            }
         }
         // new range reader lock
+        fmt.Println("New reader", ownerId)
         newra := &Range{}
         newra.startOffset = startOff
         newra.endOffset = endOff
         newra.writer = 0
-        ra.readers = make([]uint64, 0)
-        ra.readers = append(ra.readers, ownerId)
+        newra.readers = make([]uint64, 0)
+        newra.readers = append(newra.readers, ownerId)
+        obj.locks.lockedRanges[startOff] = newra
         return startOff, nil
     }
     return 0, errors.New("Unknown lock mode")
@@ -124,22 +161,32 @@ func (obj *object) unlock(lockId uint64, ownerId uint64) error {
     if !prs {
         return errors.New("Bad lockId")
     }
-    // if exclusive
-    if ra.writer != 0 {
+    // if exclusive owner
+    fmt.Printf("unlock writer:%v, owner:%v\n", ra.writer, ownerId)
+    if ra.writer > 0 && ra.writer == ownerId {
        // then unset writer
+       fmt.Println("writer done")
        ra.writer = 0
-   } else {
+    } else {
        // delete reader
        for i, rdrId := range ra.readers {
+           fmt.Printf("checking readers i:%d id:%v\n", i, rdrId)
            if rdrId == ownerId {
-               ra.readers = append(ra.readers, ra.readers[i+1:]...)
+               fmt.Println("removing reader")
+               ra.readers = append(ra.readers[:i], ra.readers[i+1:]...)
                break
            }
        }
-   }
-   // signal waiters and release mutex
-   obj.locks.cond.Signal()
-   return nil
+    }
+    // release range if no readers & writers
+    fmt.Printf("readers:%d, waiters:%d\n", ra.readers, ra.waiters)
+    if len(ra.readers) == 0  && ra.waiters == 0 {
+        fmt.Println("deleting ranges")
+       delete(obj.locks.lockedRanges, ra.startOffset)
+    }
+    // signal waiters and release mutex
+    obj.locks.cond.Signal()
+    return nil
 }
 
 // package Lock interface
