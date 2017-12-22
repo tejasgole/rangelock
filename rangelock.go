@@ -59,8 +59,11 @@ func Init() {
 }
 
 // return true if startOff lies in the locked range
-func (ra *Range) rangeConflict(startOff uint64) bool {
+func (ra *Range) rangeConflict(startOff, endOff uint64) bool {
     if startOff >=  ra.startOffset && startOff <= ra.endOffset {
+        return true
+    }
+    if startOff < ra.startOffset && endOff >= ra.startOffset {
         return true
     }
     return false
@@ -75,7 +78,7 @@ func (obj *object) lock(startOff, endOff uint64, rw int, ownerId uint64) (uint64
 try_again:
      if rw == WRITE {
         for _, ra := range obj.locks.lockedRanges {
-            if ra.rangeConflict(startOff) {
+            if ra.rangeConflict(startOff, endOff) {
                 if len(ra.readers) > 0 {
                     ra.waiters++
                     // wait on waiters queue
@@ -127,7 +130,7 @@ try_again:
             } else {
                 // check for conflict with writer on overlapping range
                 for _, ra := range obj.locks.lockedRanges {
-                    if ra.writer != 0 && ra.rangeConflict(startOff) {
+                    if ra.writer != 0 && ra.rangeConflict(startOff, endOff) {
                         ra.waiters++
                         fmt.Println("reader waiting on writer")
                         // wait on waiters queue
@@ -135,6 +138,18 @@ try_again:
                         ra.waiters--
                         goto try_again
                     }
+                }
+            }
+        } else {
+            // check for conflict with writer on overlapping range
+            for _, ra := range obj.locks.lockedRanges {
+                if ra.writer != 0 && ra.rangeConflict(startOff, endOff) {
+                    ra.waiters++
+                    fmt.Println("reader waiting on writer")
+                    // wait on waiters queue
+                    obj.locks.cond.Wait()
+                    ra.waiters--
+                    goto try_again
                 }
             }
         }
